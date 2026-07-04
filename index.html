@@ -6,8 +6,6 @@
 <title>旅程手帳｜行程與花費規劃</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
 <style>
   :root{
     --paper:#F5F0E4;
@@ -303,6 +301,22 @@
     border:1px solid var(--line); background:var(--surface-2); flex-shrink:0;
   }
   .attachment-thumb img{ width:100%; height:100%; object-fit:cover; cursor:zoom-in; display:block; }
+  .attachment-thumb.loading{ display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:11px; }
+  .file-tile{
+    width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:4px; cursor:pointer; padding:6px 4px; text-align:center; background:var(--surface-2); border:none;
+  }
+  .file-tile .file-tile-icon{ font-size:22px; line-height:1; }
+  .file-tile .file-tile-name{
+    font-size:9.5px; color:var(--muted); line-height:1.3; word-break:break-all;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
+  }
+  .file-tile:hover{ background:var(--surface); }
+  .text-preview-pre{
+    white-space:pre-wrap; word-break:break-word; max-height:56vh; overflow:auto;
+    background:var(--surface-2); border:1px solid var(--line); border-radius:10px;
+    padding:12px 14px; font-size:12.5px; line-height:1.7; margin:0; font-family:'JetBrains Mono',monospace;
+  }
   .attachment-del{
     position:absolute; top:3px; right:3px; width:20px; height:20px; border-radius:50%;
     border:none; background:rgba(38,34,31,0.6); color:#fff; font-size:12px; line-height:1;
@@ -340,6 +354,8 @@
   }
   .day-files .attachment-grid{ margin-top:0; flex:1; }
   .day-files .attachment-thumb{ width:56px; height:56px; border-radius:8px; }
+  .day-files .file-tile .file-tile-icon{ font-size:16px; }
+  .day-files .file-tile .file-tile-name{ font-size:8px; -webkit-line-clamp:1; }
   .day-files-add{
     flex-shrink:0; width:56px; height:56px; border:1px dashed var(--line); border-radius:8px;
     display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:18px;
@@ -582,7 +598,7 @@
       <input id="tripName" class="brand-title-input" value="旅程手帳" />
     </div>
     <div class="stats">
-      <button class="share-btn" id="shareLinkBtn" title="複製這個行程的分享連結，傳給同行的人">🔗 分享連結</button>
+      <button class="share-btn" id="shareLinkBtn" title="複製這個行程的連結（僅限同一台瀏覽器／裝置有效，資料只存在本機，不會同步到雲端或其他裝置）">🔗 複製連結</button>
       <div class="stat-chip">天數 <b id="statDays">-</b></div>
       <div class="stat-chip">人數 <b id="statPeople">-</b></div>
       <div class="stat-chip budget">預算 <b id="statBudget">-</b></div>
@@ -677,7 +693,7 @@
     <button class="add-day-btn serif" id="addDayBtn">＋ 新增一天</button>
   </div>
 
-  <p class="footer-note">拖曳卡片左側「⋮⋮」把手可調整順序、跨時段或跨天移動。所有內容會自動儲存，用電腦或手機打開都會看到相同資料。</p>
+  <p class="footer-note">拖曳卡片左側「⋮⋮」把手可調整順序、跨時段或跨天移動。所有內容會自動儲存在這台瀏覽器裡，重新整理網頁也不會遺失；但目前不會同步到雲端或其他裝置。</p>
 </div>
 
 </div><!-- /#tripView -->
@@ -699,24 +715,87 @@
 (function(){
   "use strict";
 
-  // ---------- Firebase (Firestore) ----------
-  const firebaseConfig = {
-    apiKey: "AIzaSyBWCsHdBXR-_OzGG5fdqDs6gpQtxFKFumc",
-    authDomain: "travel-journal-631a1.firebaseapp.com",
-    projectId: "travel-journal-631a1",
-    storageBucket: "travel-journal-631a1.firebasestorage.app",
-    messagingSenderId: "989210114337",
-    appId: "1:989210114337:web:dea364e84c005871fca660",
-    measurementId: "G-VW9J26G6JD"
-  };
-  firebase.initializeApp(firebaseConfig);
-  const db = firebase.firestore();
-  const tripsCol = db.collection("trips");
-
-  // localStorage key: which trip IDs this browser/device knows about (the "folder list").
-  // The actual trip content lives in Firestore under trips/{tripId}, so any device that
-  // opens a trip's share link (?trip=xxxx) can read/write the same data.
+  // ---------- Local storage persistence ----------
+  // Trip text data (itinerary, budget, etc.) is saved to this browser's
+  // localStorage. No network/cloud sync — the data lives only on this
+  // device/browser, but survives page refreshes and closing/reopening the tab.
+  const TRIP_DATA_PREFIX = "trip-data-v1-";
   const INDEX_KEY = "trip-index-v1";
+
+  // ---------- IndexedDB: stores the actual bytes of every attachment ----------
+  // (images / PDFs / text files). IndexedDB has a much larger quota than
+  // localStorage (typically hundreds of MB+), so attachment content lives
+  // here; only lightweight metadata {id,name,kind,size} is kept in the trip's
+  // localStorage record.
+  const IDB_NAME = "travel-journal-files-v1";
+  const IDB_STORE = "files";
+  let idbPromise = null;
+
+  function getIDB(){
+    if(idbPromise) return idbPromise;
+    idbPromise = new Promise((resolve, reject)=>{
+      if(!window.indexedDB){ reject(new Error("IndexedDB not supported")); return; }
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = ()=>{
+        const dbi = req.result;
+        if(!dbi.objectStoreNames.contains(IDB_STORE)){
+          dbi.createObjectStore(IDB_STORE, { keyPath: "id" });
+        }
+      };
+      req.onsuccess = ()=> resolve(req.result);
+      req.onerror = ()=> reject(req.error);
+    });
+    return idbPromise;
+  }
+
+  // record shape: { id, kind: 'image'|'pdf'|'txt', content }
+  // content is a data URL for image/pdf, or a plain text string for txt.
+  async function idbPutFile(record){
+    const dbi = await getIDB();
+    return new Promise((resolve, reject)=>{
+      const tx = dbi.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).put(record);
+      tx.oncomplete = ()=> resolve(true);
+      tx.onerror = ()=> reject(tx.error);
+    });
+  }
+
+  async function idbGetFile(id){
+    const dbi = await getIDB();
+    return new Promise((resolve, reject)=>{
+      const tx = dbi.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(id);
+      req.onsuccess = ()=> resolve(req.result || null);
+      req.onerror = ()=> reject(req.error);
+    });
+  }
+
+  async function idbDeleteFile(id){
+    const dbi = await getIDB();
+    return new Promise((resolve, reject)=>{
+      const tx = dbi.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).delete(id);
+      tx.oncomplete = ()=> resolve(true);
+      tx.onerror = ()=> reject(tx.error);
+    });
+  }
+
+  async function idbDeleteFiles(ids){
+    for(const id of (ids||[])){
+      try{ await idbDeleteFile(id); }catch(e){ console.error("刪除本機檔案資料失敗", e); }
+      attachmentContentCache.delete(id);
+    }
+  }
+
+  // small in-memory cache so re-rendering the same attachment list within a
+  // session doesn't have to hit IndexedDB again just to redraw a thumbnail.
+  const attachmentContentCache = new Map();
+  async function loadAttachmentContent(id){
+    if(attachmentContentCache.has(id)) return attachmentContentCache.get(id);
+    const rec = await idbGetFile(id);
+    if(rec) attachmentContentCache.set(id, rec);
+    return rec;
+  }
 
   const PERIODS = ["早上","下午","晚上"];
   const CATEGORIES = ["交通","景點","餐廳","住宿","其他"];
@@ -766,6 +845,38 @@
     return trip;
   }
 
+  // Older saves (before the IndexedDB migration) stored each image's full
+  // base64 data URL directly inside the attachment object. This moves any
+  // such leftover bytes into IndexedDB and strips them out of the JSON that
+  // lives in localStorage, so the trip's metadata stays lightweight.
+  async function migrateLegacyAttachmentList(list){
+    if(!Array.isArray(list)) return false;
+    let changed = false;
+    for(const att of list){
+      if(att && typeof att.dataUrl === "string" && !att.kind){
+        try{
+          await idbPutFile({ id: att.id, kind: "image", content: att.dataUrl });
+        }catch(e){ console.error("搬移舊圖片資料失敗", e); }
+        att.kind = "image";
+        delete att.dataUrl;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  async function migrateLegacyTrip(trip){
+    let changed = false;
+    if(await migrateLegacyAttachmentList(trip.attachments)) changed = true;
+    for(const day of (trip.itinerary||[])){
+      if(await migrateLegacyAttachmentList(day.files)) changed = true;
+      for(const b of (day.blocks||[])){
+        if(await migrateLegacyAttachmentList(b.files)) changed = true;
+      }
+    }
+    return changed;
+  }
+
   let state = null;          // the currently-open trip's data
   let currentTripId = null;  // id of the currently-open trip
   let tripIndex = [];        // lightweight list for the folder view: [{id, name, days, people, dateLabel, updatedAt}]
@@ -789,7 +900,6 @@
   }
 
   // The folder list ("which trips does this browser know about") lives in localStorage.
-  // It is only a pointer list — actual trip content always comes from Firestore.
   function loadTripIndex(){
     try{
       const raw = localStorage.getItem(INDEX_KEY);
@@ -811,55 +921,31 @@
     }
   }
 
-  // Wraps a Firestore .get() with a couple of retries, so a transient network
-  // blip isn't mistaken for "this trip doesn't exist".
-  async function firestoreGetWithRetry(id, attempts){
-    attempts = attempts || 3;
-    let lastErr = null;
-    for(let i = 0; i < attempts; i++){
-      try{
-        const snap = await tripsCol.doc(id).get();
-        return snap.exists ? snap.data() : null;
-      }catch(e){
-        lastErr = e;
-        if(i < attempts - 1) await new Promise(r=> setTimeout(r, 300 * (i + 1)));
-      }
-    }
-    throw lastErr;
-  }
-
-  async function firestoreSetWithRetry(id, dataObj, attempts){
-    attempts = attempts || 2;
-    let lastErr = null;
-    for(let i = 0; i < attempts; i++){
-      try{
-        await tripsCol.doc(id).set(dataObj);
-        return true;
-      }catch(e){
-        lastErr = e;
-        if(i < attempts - 1) await new Promise(r=> setTimeout(r, 400));
-      }
-    }
-    throw lastErr;
-  }
-
+  // Reads one trip's full data from localStorage.
   async function loadTrip(id){
     try{
-      const data = await firestoreGetWithRetry(id, 3);
-      if(data && data.json){
-        const parsed = JSON.parse(data.json);
-        if(parsed && Array.isArray(parsed.itinerary)) return backfillTrip(parsed);
+      const raw = localStorage.getItem(TRIP_DATA_PREFIX + id);
+      if(raw){
+        const parsed = JSON.parse(raw);
+        if(parsed && Array.isArray(parsed.itinerary)){
+          const trip = backfillTrip(parsed);
+          const migrated = await migrateLegacyTrip(trip);
+          if(migrated){
+            try{ localStorage.setItem(TRIP_DATA_PREFIX + id, JSON.stringify(trip)); }
+            catch(e){ console.error("寫回搬移後的行程資料失敗", e); }
+          }
+          return trip;
+        }
       }
     }catch(e){
-      console.error("讀取行程失敗（已重試多次）", e);
-      await showAlert("讀取行程資料失敗，請檢查網路連線後重新整理頁面再試一次。");
+      console.error("讀取行程資料失敗", e);
+      await showAlert("讀取行程資料失敗，本機儲存的資料可能已損毀。");
     }
     return blankTripState();
   }
 
   // Keeps the in-memory folder-list entry (name/days/people/date) accurate the
-  // instant something changes — independent of when the debounced network save
-  // actually completes, so the folder grid never looks stale after going back.
+  // instant something changes.
   function syncIndexEntryNow(){
     if(!currentTripId || !state) return;
     const entry = tripIndex.find(t=>t.id===currentTripId);
@@ -875,24 +961,22 @@
     syncIndexEntryNow();
     saveTripIndexLocal();
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveState, 500);
+    saveTimer = setTimeout(saveState, 400);
   }
 
   async function saveState(){
     if(!currentTripId || !state) return;
     syncIndexEntryNow();
     saveTripIndexLocal();
+    // Attachment bytes now live in IndexedDB, not here — this payload is just
+    // text/metadata, so it should stay tiny no matter how many files are attached.
     const payload = JSON.stringify(state);
-    const sizeKB = Math.round(payload.length / 1024);
-    if(sizeKB > 900){
-      flashSaveError("⚠ 這個行程資料量偏大（約 " + sizeKB + "KB），儲存可能失敗，建議刪除一些圖片附件");
-    }
     try{
-      await firestoreSetWithRetry(currentTripId, { json: payload, updatedAt: Date.now() }, 2);
+      localStorage.setItem(TRIP_DATA_PREFIX + currentTripId, payload);
       flashSaved();
     }catch(e){
       console.error("儲存失敗", e);
-      flashSaveError();
+      flashSaveError("⚠ 儲存失敗，瀏覽器本機空間可能已滿");
     }
   }
 
@@ -909,7 +993,7 @@
   function flashSaveError(msg){
     const el = document.getElementById("saveIndicator");
     el.classList.add("error");
-    el.textContent = msg || "⚠ 儲存失敗，請檢查網路後再試一次";
+    el.textContent = msg || "⚠ 儲存失敗，請檢查瀏覽器本機空間後再試一次";
     el.classList.add("show");
     clearTimeout(flashTimer);
     flashTimer = setTimeout(()=> el.classList.remove("show"), 5000);
@@ -963,9 +1047,20 @@
     });
   }
 
-  // ---------- image attachments (compress client-side, store as base64 text) ----------
-  // Firestore documents cap out at ~1MB, so every image is downscaled + re-encoded
-  // as JPEG before being kept in the trip's saved data.
+  // ---------- attachments (image / pdf / txt) ----------
+  // Images are downscaled + re-encoded as JPEG (still kept as a data URL) to
+  // save space; PDFs are read as-is into a data URL (can't be compressed);
+  // text files are read as plain text. The resulting "content" is stored in
+  // IndexedDB (see idbPutFile above) — only lightweight metadata
+  // {id, name, size, kind} ever touches localStorage.
+  function detectAttKind(file){
+    const name = (file.name || "").toLowerCase();
+    if(file.type && file.type.indexOf("image/") === 0) return "image";
+    if(file.type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+    if((file.type && file.type.indexOf("text/") === 0) || name.endsWith(".txt")) return "txt";
+    return null;
+  }
+
   function fileToCompressedDataUrl(file, maxDim, quality){
     maxDim = maxDim || 1280; quality = quality || 0.82;
     return new Promise((resolve, reject)=>{
@@ -992,29 +1087,57 @@
     });
   }
 
-  function estimateKB(dataUrl){
-    return Math.round((dataUrl.length * 0.75) / 1024);
+  function readFileAsDataURL(file){
+    return new Promise((resolve, reject)=>{
+      const reader = new FileReader();
+      reader.onerror = ()=> reject(new Error("read failed"));
+      reader.onload = ()=> resolve(reader.result);
+      reader.readAsDataURL(file);
+    });
   }
 
-  // Reads + compresses a FileList, pushes attachment objects into targetArray, then calls onDone.
+  function readFileAsText(file){
+    return new Promise((resolve, reject)=>{
+      const reader = new FileReader();
+      reader.onerror = ()=> reject(new Error("read failed"));
+      reader.onload = ()=> resolve(reader.result);
+      reader.readAsText(file);
+    });
+  }
+
+  function estimateContentKB(content){
+    if(typeof content !== "string") return 0;
+    const isDataUrl = content.indexOf("data:") === 0;
+    return Math.round((content.length * (isDataUrl ? 0.75 : 1)) / 1024);
+  }
+
+  // Reads (and compresses, for images) a FileList, stores each file's bytes in
+  // IndexedDB, and pushes lightweight metadata into targetArray. Calls onDone when finished.
   async function addFilesToArray(fileList, targetArray, onDone){
     const files = Array.from(fileList || []);
     for(const file of files){
-      if(!file.type || file.type.indexOf("image/") !== 0){
-        await showAlert("「" + file.name + "」不是圖片檔案，目前只支援上傳圖片（例如票券截圖、QR code）。");
+      const kind = detectAttKind(file);
+      if(!kind){
+        await showAlert("「" + file.name + "」的檔案格式目前不支援，只能上傳圖片、PDF 或文字檔（.txt）。");
         continue;
       }
       try{
-        const dataUrl = await fileToCompressedDataUrl(file);
-        const kb = estimateKB(dataUrl);
-        if(kb > 1800){
-          const ok = await showConfirm("「" + file.name + "」壓縮後約 " + kb + "KB，偏大可能拖慢同步速度，確定要加入嗎？");
+        let content;
+        if(kind === "image") content = await fileToCompressedDataUrl(file);
+        else if(kind === "pdf") content = await readFileAsDataURL(file);
+        else content = await readFileAsText(file);
+
+        const kb = estimateContentKB(content);
+        if(kb > 4000){
+          const ok = await showConfirm("「" + file.name + "」約 " + kb + "KB，檔案偏大，確定要加入嗎？");
           if(!ok) continue;
         }
-        targetArray.push({ id: nid("att"), name: file.name, dataUrl, size: kb });
+        const id = nid("att");
+        await idbPutFile({ id, kind, content });
+        targetArray.push({ id, name: file.name, size: kb, kind });
       }catch(e){
         console.error(e);
-        await showAlert("讀取「" + file.name + "」時發生錯誤，請換一張圖片試試看。");
+        await showAlert("處理「" + file.name + "」時發生錯誤，請再試一次。");
       }
     }
     onDone();
@@ -1025,15 +1148,50 @@
     grid.className = "attachment-grid";
     list.forEach(att=>{
       const thumb = document.createElement("div");
-      thumb.className = "attachment-thumb";
+      thumb.className = "attachment-thumb loading";
 
-      const img = document.createElement("img");
-      img.src = att.dataUrl; img.alt = att.name; img.title = att.name;
-      img.addEventListener("click", ()=> openLightbox(att.dataUrl, att.name));
-      thumb.appendChild(img);
+      loadAttachmentContent(att.id).then(rec=>{
+        thumb.classList.remove("loading");
+        const kind = (rec && rec.kind) || att.kind || "image";
+        const content = rec ? rec.content : null;
+
+        if(!content){
+          thumb.textContent = "⚠";
+          thumb.title = "找不到這個檔案的內容，可能已被清除";
+          return;
+        }
+
+        if(kind === "image"){
+          const img = document.createElement("img");
+          img.src = content; img.alt = att.name; img.title = att.name;
+          img.addEventListener("click", ()=> openLightbox(content, att.name));
+          thumb.appendChild(img);
+        } else {
+          const tile = document.createElement("button");
+          tile.type = "button";
+          tile.className = "file-tile";
+          tile.title = att.name;
+          const icon = document.createElement("div");
+          icon.className = "file-tile-icon";
+          icon.textContent = kind === "pdf" ? "📄" : "📝";
+          const label = document.createElement("div");
+          label.className = "file-tile-name";
+          label.textContent = att.name;
+          tile.appendChild(icon); tile.appendChild(label);
+          tile.addEventListener("click", ()=>{
+            if(kind === "pdf") openPdfInNewTab(content, att.name);
+            else openTextPreview(content, att.name);
+          });
+          thumb.appendChild(tile);
+        }
+      }).catch(e=>{
+        console.error("讀取檔案內容失敗", e);
+        thumb.classList.remove("loading");
+        thumb.textContent = "⚠";
+      });
 
       const del = document.createElement("button");
-      del.className = "attachment-del"; del.textContent = "×"; del.title = "刪除這張圖片";
+      del.className = "attachment-del"; del.textContent = "×"; del.title = "刪除這個檔案";
       del.addEventListener("click", (e)=>{ e.stopPropagation(); onRemove(att.id); });
       thumb.appendChild(del);
 
@@ -1052,6 +1210,50 @@
     const close = document.createElement("button");
     close.className = "lightbox-close"; close.textContent = "×";
     box.appendChild(img); box.appendChild(close);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    function remove(){ overlay.remove(); }
+    overlay.addEventListener("click", (e)=>{ if(e.target === overlay) remove(); });
+    close.addEventListener("click", remove);
+  }
+
+  // Converts a PDF data URL to a Blob URL and opens it in a new tab (data:
+  // URLs can hit size/security limits when opened directly in some browsers).
+  function openPdfInNewTab(dataUrl, name){
+    try{
+      const commaIdx = dataUrl.indexOf(",");
+      const meta = dataUrl.slice(0, commaIdx);
+      const base64 = dataUrl.slice(commaIdx + 1);
+      const mimeMatch = meta.match(/data:(.*?);base64/);
+      const mime = mimeMatch ? mimeMatch[1] : "application/pdf";
+      const binary = atob(base64);
+      const arr = new Uint8Array(binary.length);
+      for(let i=0;i<binary.length;i++) arr[i] = binary.charCodeAt(i);
+      const blob = new Blob([arr], { type: mime });
+      const url = URL.createObjectURL(blob);
+      window.open(url, "_blank");
+      setTimeout(()=> URL.revokeObjectURL(url), 60000);
+    }catch(e){
+      console.error("開啟 PDF 失敗", e);
+      window.open(dataUrl, "_blank");
+    }
+  }
+
+  // Shows a text file's content in a simple read-only preview modal.
+  function openTextPreview(text, name){
+    const overlay = document.createElement("div");
+    overlay.className = "block-editor-overlay";
+    const box = document.createElement("div");
+    box.className = "block-editor-box";
+    const header = document.createElement("div");
+    header.className = "block-editor-header";
+    header.textContent = name || "文字檔內容";
+    const pre = document.createElement("pre");
+    pre.className = "text-preview-pre";
+    pre.textContent = text;
+    const close = document.createElement("button");
+    close.className = "block-editor-close"; close.textContent = "關閉";
+    box.appendChild(header); box.appendChild(pre); box.appendChild(close);
     overlay.appendChild(box);
     document.body.appendChild(overlay);
     function remove(){ overlay.remove(); }
@@ -1086,7 +1288,8 @@
 
     function refreshAttachments(){
       attWrap.innerHTML = "";
-      attWrap.appendChild(renderAttachmentGrid(block.files, (attId)=>{
+      attWrap.appendChild(renderAttachmentGrid(block.files, async (attId)=>{
+        await idbDeleteFiles([attId]);
         block.files = block.files.filter(f=>f.id!==attId);
         refreshAttachments(); scheduleSave();
       }));
@@ -1095,9 +1298,9 @@
 
     const addLabel = document.createElement("label");
     addLabel.className = "attachment-add-btn";
-    addLabel.textContent = "＋ 上傳圖片／票券";
+    addLabel.textContent = "＋ 上傳圖片／PDF／文字檔";
     const fileInput = document.createElement("input");
-    fileInput.type = "file"; fileInput.accept = "image/*"; fileInput.multiple = true;
+    fileInput.type = "file"; fileInput.accept = "image/*,application/pdf,.pdf,text/plain,.txt"; fileInput.multiple = true;
     fileInput.style.display = "none";
     fileInput.addEventListener("change", async (e)=>{
       const files = e.target.files;
@@ -1110,7 +1313,7 @@
 
     const hint = document.createElement("p");
     hint.className = "attachment-hint";
-    hint.textContent = "圖片會自動壓縮後以文字格式儲存，方便同步跟載入。";
+    hint.textContent = "圖片會自動壓縮，檔案內容存在這台瀏覽器的本機資料庫（IndexedDB）裡，容量比之前大很多。";
     box.appendChild(hint);
 
     const doneBtn = document.createElement("button");
@@ -1479,9 +1682,9 @@
 
     const dupDayBtn = document.createElement("button");
     dupDayBtn.className = "icon-btn"; dupDayBtn.textContent = "🗐"; dupDayBtn.title = "複製這一天";
-    dupDayBtn.addEventListener("click", ()=>{
+    dupDayBtn.addEventListener("click", async ()=>{
       const pos = state.itinerary.findIndex(d=>d.id===day.id);
-      const clone = cloneDayWithNewIds(day);
+      const clone = await cloneDayWithNewIds(day);
       state.itinerary.splice(pos + 1, 0, clone);
       resequenceDates();
       render(); scheduleSave();
@@ -1491,8 +1694,12 @@
     const delDayBtn = document.createElement("button");
     delDayBtn.className = "icon-btn"; delDayBtn.textContent = "×"; delDayBtn.title = "刪除這一天";
     delDayBtn.addEventListener("click", async ()=>{
-      const ok = await showConfirm("確定要刪除「Day "+(idx+1)+"」的行程嗎？");
+      const ok = await showConfirm("確定要刪除「Day "+(idx+1)+"」的行程嗎？這也會一併刪除這一天上傳的圖片與檔案。");
       if(ok){
+        const ids = [];
+        (day.files||[]).forEach(f=> ids.push(f.id));
+        (day.blocks||[]).forEach(b=> (b.files||[]).forEach(f=> ids.push(f.id)));
+        await idbDeleteFiles(ids);
         state.itinerary = state.itinerary.filter(d=>d.id!==day.id);
         resequenceDates();
         render(); scheduleSave();
@@ -1525,7 +1732,8 @@
     label.textContent = "📎 檔案";
     bar.appendChild(label);
 
-    bar.appendChild(renderAttachmentGrid(day.files, (attId)=>{
+    bar.appendChild(renderAttachmentGrid(day.files, async (attId)=>{
+      await idbDeleteFiles([attId]);
       day.files = day.files.filter(f=>f.id!==attId);
       renderDays(); scheduleSave();
     }));
@@ -1534,12 +1742,12 @@
     const addLabel = document.createElement("label");
     addLabel.className = "day-files-add";
     addLabel.setAttribute("for", inputId);
-    addLabel.title = "上傳這一天要用的圖片／票券";
+    addLabel.title = "上傳這一天要用的圖片／PDF／文字檔";
     addLabel.textContent = "＋";
     bar.appendChild(addLabel);
 
     const fileInput = document.createElement("input");
-    fileInput.type = "file"; fileInput.id = inputId; fileInput.accept = "image/*";
+    fileInput.type = "file"; fileInput.id = inputId; fileInput.accept = "image/*,application/pdf,.pdf,text/plain,.txt";
     fileInput.multiple = true; fileInput.style.display = "none";
     fileInput.addEventListener("change", async (e)=>{
       const files = e.target.files;
@@ -1665,9 +1873,9 @@
 
     const dupBtn = document.createElement("button");
     dupBtn.className = "card-dup"; dupBtn.textContent = "🗐"; dupBtn.title = "複製這張小卡";
-    dupBtn.addEventListener("click", ()=>{
+    dupBtn.addEventListener("click", async ()=>{
       const pos = day.blocks.findIndex(b=>b.id===block.id);
-      const clone = cloneBlockWithNewIds(block);
+      const clone = await cloneBlockWithNewIds(block);
       day.blocks.splice(pos + 1, 0, clone);
       renderDays(); renderStats(); scheduleSave();
     });
@@ -1675,7 +1883,8 @@
 
     const delBtn = document.createElement("button");
     delBtn.className = "card-del"; delBtn.textContent = "×";
-    delBtn.addEventListener("click", ()=>{
+    delBtn.addEventListener("click", async ()=>{
+      await idbDeleteFiles((block.files||[]).map(f=>f.id));
       day.blocks = day.blocks.filter(b=>b.id!==block.id);
       renderDays(); renderStats(); scheduleSave();
     });
@@ -1976,9 +2185,9 @@
       const linkText = url.toString();
       try{
         await navigator.clipboard.writeText(linkText);
-        await showAlert("分享連結已複製！\n傳給同行的人，對方打開連結就能看到並一起編輯這份行程。");
+        await showAlert("連結已複製！\n注意：資料只儲存在這台瀏覽器（本機），在其他裝置或瀏覽器開啟這個連結不會看到相同內容。");
       }catch(e){
-        await showAlert("無法自動複製，請手動複製以下分享連結：\n" + linkText);
+        await showAlert("無法自動複製，請手動複製以下連結（注意：資料只存在這台瀏覽器本機）：\n" + linkText);
       }
     });
   }
@@ -2046,71 +2255,111 @@
     saveTripIndexLocal();
     renderFolderGrid();
     try{
-      await firestoreSetWithRetry(id, { json: JSON.stringify(blank), updatedAt: Date.now() }, 2);
+      localStorage.setItem(TRIP_DATA_PREFIX + id, JSON.stringify(blank));
     }catch(e){
       console.error("新增行程失敗", e);
-      await showAlert("新增行程時發生網路錯誤，請檢查網路連線後重新整理再試一次。");
+      await showAlert("新增行程時發生錯誤，瀏覽器本機空間可能已滿。");
     }
   }
 
+  // Copies a list of attachments to brand-new ids, including their actual
+  // bytes in IndexedDB (not just the metadata) so the clone is independent.
+  async function cloneAttachmentList(list){
+    const result = [];
+    for(const att of (list||[])){
+      const newId = nid("att");
+      try{
+        const rec = await loadAttachmentContent(att.id);
+        if(rec) await idbPutFile({ id: newId, kind: rec.kind, content: rec.content });
+      }catch(e){ console.error("複製檔案內容失敗", e); }
+      result.push(Object.assign({}, att, { id: newId }));
+    }
+    return result;
+  }
+
   // Deep-clones a single itinerary block (景點/交通/餐廳/住宿 card) and regenerates its ids.
-  function cloneBlockWithNewIds(block){
+  async function cloneBlockWithNewIds(block){
     const clone = JSON.parse(JSON.stringify(block));
     clone.id = nid("c");
-    (clone.files||[]).forEach(f=>{ f.id = nid("att"); });
+    clone.files = await cloneAttachmentList(clone.files);
     return clone;
   }
 
   // Deep-clones a single day and regenerates its internal ids (blocks + files).
-  function cloneDayWithNewIds(day){
+  async function cloneDayWithNewIds(day){
     const clone = JSON.parse(JSON.stringify(day));
     clone.id = nid("day");
-    (clone.blocks||[]).forEach(b=>{
+    const newBlocks = [];
+    for(const b of (clone.blocks||[])){
       b.id = nid("c");
-      (b.files||[]).forEach(f=>{ f.id = nid("att"); });
-    });
-    (clone.files||[]).forEach(f=>{ f.id = nid("att"); });
+      b.files = await cloneAttachmentList(b.files);
+      newBlocks.push(b);
+    }
+    clone.blocks = newBlocks;
+    clone.files = await cloneAttachmentList(clone.files);
     return clone;
   }
 
   // Deep-clones a trip and regenerates every internal id so it's fully independent
   // from the original (categories, days, blocks, and every level of attachments).
-  function cloneTripWithNewIds(trip){
+  async function cloneTripWithNewIds(trip){
     const clone = JSON.parse(JSON.stringify(trip));
     (clone.categories||[]).forEach(c=>{ c.id = nid("cat"); });
-    (clone.attachments||[]).forEach(a=>{ a.id = nid("att"); });
-    (clone.itinerary||[]).forEach(day=>{
+    clone.attachments = await cloneAttachmentList(clone.attachments);
+    const newItinerary = [];
+    for(const day of (clone.itinerary||[])){
       day.id = nid("day");
-      (day.blocks||[]).forEach(b=>{
+      const newBlocks = [];
+      for(const b of (day.blocks||[])){
         b.id = nid("c");
-        (b.files||[]).forEach(f=>{ f.id = nid("att"); });
-      });
-      (day.files||[]).forEach(f=>{ f.id = nid("att"); });
-    });
+        b.files = await cloneAttachmentList(b.files);
+        newBlocks.push(b);
+      }
+      day.blocks = newBlocks;
+      day.files = await cloneAttachmentList(day.files);
+      newItinerary.push(day);
+    }
+    clone.itinerary = newItinerary;
     return clone;
+  }
+
+  // Collects every attachment id referenced anywhere in a trip (trip-level,
+  // per-day, and per-card), used when wiping a trip's IndexedDB records.
+  function collectTripAttachmentIds(trip){
+    const ids = [];
+    (trip.attachments||[]).forEach(a=> ids.push(a.id));
+    (trip.itinerary||[]).forEach(day=>{
+      (day.files||[]).forEach(f=> ids.push(f.id));
+      (day.blocks||[]).forEach(b=> (b.files||[]).forEach(f=> ids.push(f.id)));
+    });
+    return ids;
   }
 
   async function duplicateTrip(id, name){
     const original = await loadTrip(id);
-    const clone = backfillTrip(cloneTripWithNewIds(original));
+    const clone = backfillTrip(await cloneTripWithNewIds(original));
     clone.name = (name || original.name || "未命名行程") + "（複製）";
     const newId = nid("trip");
     tripIndex.push(indexEntryFrom(newId, clone));
     saveTripIndexLocal();
     renderFolderGrid();
     try{
-      await firestoreSetWithRetry(newId, { json: JSON.stringify(clone), updatedAt: Date.now() }, 2);
+      localStorage.setItem(TRIP_DATA_PREFIX + newId, JSON.stringify(clone));
     }catch(e){ console.error("複製行程失敗", e); }
   }
 
   async function deleteTrip(id, name){
-    const ok = await showConfirm("確定要刪除「" + (name || "這個行程") + "」嗎？此動作無法復原，雲端上的資料也會一併刪除（分享出去的連結將失效）。");
+    const ok = await showConfirm("確定要刪除「" + (name || "這個行程") + "」嗎？此動作無法復原，包含所有已上傳的圖片與檔案。");
     if(!ok) return;
     tripIndex = tripIndex.filter(t=>t.id!==id);
     saveTripIndexLocal();
     renderFolderGrid();
     try{
-      await tripsCol.doc(id).delete();
+      const trip = await loadTrip(id);
+      await idbDeleteFiles(collectTripAttachmentIds(trip));
+    }catch(e){ console.error("清除附件失敗", e); }
+    try{
+      localStorage.removeItem(TRIP_DATA_PREFIX + id);
     }catch(e){ console.error("刪除行程失敗", e); }
   }
 
@@ -2147,8 +2396,8 @@
     bindDayNavScroll();
     document.getElementById("backToFoldersBtn").addEventListener("click", backToFolders);
 
-    // If opened via a shared link (?trip=xxxx), jump straight into that trip and
-    // remember it in this browser's local folder list for next time.
+    // If opened via a link (?trip=xxxx) that this browser has data for, jump
+    // straight into that trip.
     const params = new URLSearchParams(window.location.search);
     const sharedId = params.get("trip");
     if(sharedId){
